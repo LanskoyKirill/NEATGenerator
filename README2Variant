@@ -1,0 +1,189 @@
+To write documentation to facilitate the entry of people unfamiliar with the project, a generative model was used (DeepSeek)
+
+# NEAT Text Generator - Detailed Documentation
+
+## Project Overview
+This project implements a text generator based on neuroevolution of topologies (NEAT). The system evolves neural networks to generate English phrases using incremental learning with a gradual increase in vocabulary.
+
+## Project Architecture
+
+### 1. Phrases.cs - Training Data Management
+
+#### Main Variables:
+- `phrases`: List of English phrases to train
+- `lengthOfknown`: Number of known phrases at the current stage
+- `changeWord`: Flag for switching to new phrases
+
+#### Key Methods:
+
+**GetAllPhrases()**
+``csharp
+public List<List<string>> GetAllPhrases()
+Returns all phrases in the format of [input_phrase, target_phrase] pairs. Used to initialize the tokenizer.
+
+GetPhrase()
+
+csharp
+public List<string> GetPhrase()
+Returns a random phrase for training with a gradual introduction mechanism for new phrases:
+
+A new phrase is chosen with a 20% probability
+Otherwise, a random one from the already known ones is chosen
+Returns [phrase, phrase, "Yes"/"No"], where the third element indicates whether the phrase is new
+2. Tokenizer.cs - Text Tokenization
+
+Constants:
+
+PAD_TOKEN = 0: Padding token
+SOS_TOKEN = 1: Sequence start token
+EOS_TOKEN = 2: Sequence end token
+UNK_TOKEN = 3: Unknown word token
+Methods:
+
+Tokenize(string sentence)
+
+csharp
+public List<int> Tokenize(string sentence)
+Converts a string into a sequence of tokens:
+
+Adds SOS_TOKEN to top
+Splits text into words, converts to lowercase
+Replaces unknown words with UNK_TOKEN
+Appends EOS_TOKEN to the end
+Detokenize(List<int> tokens)
+
+csharp
+public string Detokenize(List<int> tokens)
+Reconstructs a string from a sequence of tokens, ignoring service tokens.
+
+3. AI.cs - NEAT Network Implementation
+
+Network Structure:
+
+neurones: Neuron activations
+inpInnov/outInnov: Input/output innovation connection numbers
+weights: Connection weights
+RNNs: Recurrent connection flags
+order: Neuron activation order
+Key Methods:
+
+ProcessGenerationLogic()
+
+csharp
+private void ProcessGenerationLogic()
+Main Text Generation Loop:
+
+Reset neuron activations
+Feed the current token as input
+Forward through the network
+Select the next token (maximum activation)
+Add the token to the output sequence
+Check termination conditions
+CalculateTokenFitness()
+
+csharp
+public void CalculateTokenFitness()
+Calculates fitness based on the match with the target sequence:
+
+Scores 10 points for each correct token
+Adds a bonus for Consecutive matches
+Penalizes for length differences and repetitions
+Normalizes the result to a range of 0-1
+Evolution operators:
+
+AddNode(): Adds a new neuron
+AddLink(): Adds a new connection
+Weight mutation: Randomly changes weights with varying intensity
+4. GameManager.cs - Evolution Management
+
+Main parameters:
+
+population = 1000: Population size
+selection = 50: Number of individuals to select
+phaseThreshold = 0.7: Threshold for moving to the next phase
+Evolution algorithm:
+
+Population initialization
+
+Generate 1000 random networks
+Tokenizer initialization
+Fitness evaluation
+
+Each network generates text
+Fitness is calculated based on matches to the target phrase
+Specification
+
+Individuals are grouped by innovation numbers
+The genetic distance between networks is calculated
+Selection and Reproduction
+
+The 50 best networks are selected
+Offspring are created with crossover and mutations
+Step-by-step training
+
+Upon reaching the fitness threshold (0.7) for 10 new phrases
+New tokens are added to the dictionary
+The number of known phrases increases
+Innovation system:
+
+csharp
+public int DealInnovations(int inoV, int outV, bool rnnV)
+Assigns unique innovation numbers to new genes (links), ensuring correct alignment during crossover.
+
+Data Flow
+
+Initialization:
+
+text
+Phrases → Tokenizer → GameManager → Populate AIs
+Evolution Cycle:
+
+text
+Get Training Phrase → Tokenize → AI Generation →
+Calculate Fitness → Speciation → Selection →
+Crossover/Mutation → New Generation
+Phase Training:
+
+text
+Phase 1 (1-5 phrases) → Phase 2 (6-10 phrases) → ... → All Phrases
+Parameter Settings
+
+Key parameters in the Unity inspector:
+
+GameManager:
+
+population: Population size (recommended 500-1000)
+selection: Number of individuals to select (10-20% of the population)
+phaseThreshold: Transition threshold (0.6-0.8)
+batchSize: Batch size for training
+AI:
+
+speed: Training speed (0.1)
+maxIterations: Maximum generation length
+Debugging and monitoring
+
+Logging:
+
+The Unity console displays training progress
+theBest list saves the history of best results
+Diagram displays fitness and progress graphs
+Key indicators:
+
+Fitness: Generation quality (0-1)
+Vocabulary: Number of known tokens
+Epoch: Generation number
+Phase: Current training phase
+Project extension
+
+Adding new phrases:
+
+Add phrases to the phrases list in Phrases.cs
+The system will automatically add tokens to the vocabulary
+Architecture setup:
+
+Change vocabSize for a different vocabulary size
+Configure parameters
+Three mutations in GameManager.Update()
+Visualization:
+
+Diagram.cs displays the training progress
