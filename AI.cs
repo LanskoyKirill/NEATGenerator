@@ -19,8 +19,11 @@ public class AI : MonoBehaviour
     public float textHowIsGood = 0;
     private float accumulatedFitness = 0f;
     private int processedInBatch = 0;
-    public int maxIterations = 1000;
-    private int iterations = 0;
+
+    private float accumulatedNewFitness = 0f;   // сумма фитнеса на новых фразах
+    private int processedNewInBatch = 0;        // количество шагов на новых фразах
+    public float newPhraseFitness = 0f;         // среднее за батч на новых фразах (для удобства)
+    private int maxIterations = 20;
 
     // Структура сети
     public List<float> neurones = new List<float>();
@@ -32,6 +35,7 @@ public class AI : MonoBehaviour
     public List<float> RNNneurones = new List<float>();
     public List<int> order = new List<int>();
     public List<Dictionary<int, float>> adjList = new List<Dictionary<int, float>>();
+    public Dictionary<int, bool> neuronHasFFIncoming = new Dictionary<int, bool>();
     public List<int> innovations = new List<int>();
 
     public int testing = 0;
@@ -49,14 +53,19 @@ public class AI : MonoBehaviour
 
     public int prevNumber = 0;
     public int thisNumber = 0;
-    private int outConnections = 1; // Только bias на входе
+    private int outConnections = 1;
     private int initalNeurones;
     public int desiredNeurones;
 
-    // Состояние
-    private bool isGenerating = false;
-    private int currentTokenIndex = 0;
-    private int nextInputToken = 1; // SOS token
+    // Состояние для поэтапной подачи
+    public int minContextLength = 3;   // минимальная длина контекста перед оценкой
+    public int seedLength = 4;               // задаётся GameManager
+    private int seedIndex = 0;                // текущий индекс в seedTokens
+    private bool generationComplete = false;  // флаг завершения генерации
+    private List<int> currentContext = new List<int>();
+    private bool seedProcessed = false;
+    private List<int> seedTokens = new List<int>();
+    private int expectedTokenId = -1;
     
     // Токенизатор
     [NonSerialized] public Tokenizer tokenizer;
@@ -65,44 +74,41 @@ public class AI : MonoBehaviour
     private HashSet<int> availableTokens = new HashSet<int>();
     private List<int> availableInputNeurons = new List<int>();
     private List<int> availableOutputNeurons = new List<int>();
-
     public void Start()
     {
         go = true;
-        isGenerating = false;
+        generationComplete = false;
         howIsGood = 0;
         textHowIsGood = 0;
         cIterator = 0;
-        currentTokenIndex = 0;
-        nextInputToken = 1;
         generatedText = "";
         outputTokens.Clear();
+        ResetBatchStats();
 
-        // 1. bias нейрон (0)
-        // 2. входные нейроны для токенов (1..vocabSize)
-        // 3. выходные нейроны (vocabSize+1..vocabSize*2)
-        // 4. скрытые нейроны (после vocabSize*2)
-        
-        initalNeurones = 1 + vocabSize + vocabSize; // bias + входы + выходы
-        
+        // 0: bias (всегда 1)
+        // 1: phase (0 - ввод, 1 - генерация)
+        // 2..1+vocabSize: входные токены
+        // 2+vocabSize..1+2*vocabSize: выходные токены
+        // далее скрытые нейроны
+        initalNeurones = 2 + vocabSize + vocabSize; // 2 + 2*vocabSize
+
         if (neurones.Count < initalNeurones)
         {
             neurones.Clear();
             RNNneurones.Clear();
-            
-            // bias
-            neurones.Add(1f);
+
+            neurones.Add(1f);               // bias
             RNNneurones.Add(1f);
-            
-            // входные нейроны для токенов
-            for (int i = 0; i < vocabSize; i++)
+            neurones.Add(0f);                // phase
+            RNNneurones.Add(0f);
+
+            for (int i = 0; i < vocabSize; i++) // входные токены
             {
                 neurones.Add(0f);
                 RNNneurones.Add(0f);
             }
-            
-            // выходные нейроны
-            for (int i = 0; i < vocabSize; i++)
+
+            for (int i = 0; i < vocabSize; i++) // выходные токены
             {
                 neurones.Add(0f);
                 RNNneurones.Add(0f);
@@ -110,19 +116,18 @@ public class AI : MonoBehaviour
         }
         else
         {
-            // Сбрасываем все нейроны
+            // Если сеть уже существовала, обнуляем все нейроны, но bias и phase установятся позже
             for (int i = 0; i < neurones.Count; i++)
             {
                 neurones[i] = 0f;
                 RNNneurones[i] = 0f;
             }
-            neurones[0] = 1f; // bias
+            neurones[0] = 1f;
             RNNneurones[0] = 1f;
         }
-        
-        // Теперь выходные нейроны начинаются после входных
-        outConnections = 1 + vocabSize;
-        
+
+        outConnections = 2 + vocabSize; // начало выходных нейронов
+
         // Удаление невалидных связей
         for (int i = 0; i < inpInnov.Count; i++)
         {
@@ -138,31 +143,26 @@ public class AI : MonoBehaviour
             }
         }
 
-        UpdateAvailableNeurons();
-        
+        UpdateAvailableNeurons(availableTokens);
         makeOrder();
         Adder();
-        
-        // Загрузка материала
+
         Material AIMaterial = Resources.Load(spawnerOfNN.name, typeof(Material)) as Material;
         if (AIMaterial != null)
-        {
             gameObject.GetComponent<Renderer>().material = AIMaterial;
-        }
-        
+
         if (order.Count > 3 && order[0] == 1 && order[1] == 0 && order[2] == 0)
-        {
             ++testing;
-        }
-        
-        // Токенизация если токенизатор есть
-        if (tokenizer != null && !string.IsNullOrEmpty(inputPhrase) && !string.IsNullOrEmpty(targetPhrase))
+
+        // Проверка целевой последовательности
+        if (targetTokens == null || targetTokens.Count < 3)
         {
-            inputTokens = tokenizer.Tokenize(inputPhrase);
-            targetTokens = tokenizer.Tokenize(targetPhrase);
+            Debug.LogWarning("Target tokens too short, generation disabled");
+            generationComplete = true;
+            go = false;
         }
     }
-    
+
     void Update()
     {
         if (!inpInnov.Any())
@@ -170,285 +170,176 @@ public class AI : MonoBehaviour
             Destroy(gameObject);
             return;
         }
-        
-        if (go == true)
+
+        if (go && !generationComplete)
         {
-            neurones[0] = 1;
-            
-            if (tokenizer == null || targetTokens.Count == 0)
-            {
-                Debug.Log("No tokenizer or targetTokens is empty!");
-                return;
-            }
-            
-            ProcessGenerationLogic();
+            ProcessStep();
         }
     }
-    
-    private void ProcessGenerationLogic()
+
+    private void ProcessStep()
     {
-        // Сброс нейронов кроме bias
-        for (int i = 1; i < neurones.Count; i++)
+        int totalTargetLength = targetTokens.Count;
+        if (totalTargetLength < 3)
         {
-            neurones[i] = 0f;
+            generationComplete = true;
+            go = false;
+            return;
         }
-        neurones[0] = 1f;
-        
-        // Генерация начинается с SOS
-        if (!isGenerating)
+
+        int firstPredictionIndex = seedLength;
+        int lastPredictionIndex = totalTargetLength - 2;
+
+        if (firstPredictionIndex < 1) firstPredictionIndex = 1;
+        if (firstPredictionIndex > lastPredictionIndex)
         {
-            nextInputToken = Tokenizer.SOS_TOKEN;
-            isGenerating = true;
-            outputTokens.Clear();
-            outputTokens.Add(Tokenizer.SOS_TOKEN);
+            generationComplete = true;
+            go = false;
+            return;
         }
-        
-        // Подаем текущий токен на вход (входные нейроны 1..vocabSize)
-        int currentToken = nextInputToken;
-        if (currentToken >= 0 && currentToken < vocabSize)
+
+        for (int pos = firstPredictionIndex; pos <= lastPredictionIndex; pos++)
         {
-            // Входной нейрон для токена: 1 + token
-            int inputNeuronIndex = 1 + currentToken;
-            if (inputNeuronIndex < neurones.Count && inputNeuronIndex >= 1)
+            ResetNeurons();
+
+            // Подаём контекст (все правильные токены от 1 до pos)
+            for (int ctxIdx = 1; ctxIdx <= pos; ctxIdx++)
             {
-                neurones[inputNeuronIndex] = 1f;
+                int token = targetTokens[ctxIdx];
+
+                for (int j = 2; j < 2 + vocabSize; j++)
+                    neurones[j] = 0f;
+                int inputIdx = 2 + token;
+                if (inputIdx < neurones.Count)
+                    neurones[inputIdx] = 1f;
+
+                neurones[1] = 0f; // phase = 0
+                RunNetwork();
+                UpdateRNNState();
+            }
+
+            // Предсказание следующего токена
+            neurones[1] = 1f; // phase = 1
+            RunNetwork();
+
+            int predictedToken = GetPredictedToken();
+            outputTokens.Add(predictedToken);
+
+            int expectedToken = targetTokens[pos + 1];
+            float fitness = 0f;
+
+            if (predictedToken == expectedToken)
+            {
+                fitness = 1f;
             }
             else
             {
-                Debug.LogError($"Input neuron index out of range: {inputNeuronIndex}, neurones count: {neurones.Count}");
+                float[] outputActivations = new float[vocabSize];
+                for (int i = 0; i < vocabSize; i++)
+                {
+                    int idx = outConnections + i;
+                    outputActivations[i] = idx < neurones.Count ? neurones[idx] : 0f;
+                }
+                float temperature = 0.5f;
+                float[] probs = Softmax(outputActivations, temperature);
+                if (expectedToken >= 0 && expectedToken < vocabSize)
+                    fitness = probs[expectedToken];
+            }
+
+            if (ifNew)
+            {
+                //Raise the importance of learning new words
+                accumulatedNewFitness += fitness * 3;
+                processedNewInBatch+=3;
+            }
+            accumulatedFitness += fitness;
+            processedInBatch++;
+        }
+
+        if (tokenizer != null)
+            generatedText = tokenizer.Detokenize(outputTokens);
+
+        generationComplete = true;
+        go = false;
+    }
+
+    private void ResetNeurons()
+    {
+        for (int i = 0; i < neurones.Count; i++)
+        {
+            neurones[i] = 0f;
+            RNNneurones[i] = 0f;
+        }
+        neurones[0] = 1f;
+        RNNneurones[0] = 1f;
+    }
+
+
+    private void ComputeExpectedToken()
+    {
+        if (targetTokens != null && targetTokens.Count > 2)
+        {
+            int seedCount = seedTokens.Count;
+            // targetTokens: [SOS, token1, token2, ..., tokenN, EOS]
+            // ожидаемый токен идёт сразу после seed
+            if (seedCount + 1 < targetTokens.Count)
+            {
+                expectedTokenId = targetTokens[seedCount + 1];
+            }
+            else
+            {
+                expectedTokenId = Tokenizer.EOS_TOKEN; // fallback
             }
         }
-        
-        // Пропускаем через сеть
+        else
+        {
+            expectedTokenId = Tokenizer.UNK_TOKEN;
+        }
+    }
+
+    // Вспомогательный метод для прямого прохода
+    private void RunNetwork()
+    {
         for (int i = 0; i < order.Count; i++)
         {
             int thisNeuron = order[i];
-            if (thisNeuron >= 1) // Все нейроны кроме bias используют активацию
+            // Применяем активацию ко всем нейронам, кроме входных (индексы 0,1 и входные токены)
+            if (thisNeuron >= 2 + vocabSize) // всё, что после входных токенов
             {
-                neurones[thisNeuron] = (float)Math.Tanh(neurones[thisNeuron]);
+                neurones[thisNeuron] = (float)activationFunction(neurones[thisNeuron]);
             }
+            // Распространение сигнала по исходящим feed‑forward связям
             if (adjList.Count > thisNeuron)
             {
                 foreach (var b in adjList[thisNeuron])
-                {
                     if (b.Key < neurones.Count)
-                    {
                         neurones[b.Key] += b.Value * neurones[thisNeuron];
-                    }
-                }
             }
         }
-        
-        // Генерация следующего токена (выходные нейроны начинаются с outConnections)
+    }
+    
+    private int GetPredictedToken()
+    {
         float maxActivation = -999f;
         int predictedToken = Tokenizer.UNK_TOKEN;
         
         int outputStart = outConnections;
         int outputEnd = Mathf.Min(outConnections + vocabSize, neurones.Count);
         
-        //Debug.Log($"Checking output neurons from {outputStart} to {outputEnd}");
-        
         for (int i = outputStart; i < outputEnd; i++)
         {
-            //Debug.Log($"Output neuron {i} activation: {neurones[i]}");
-            if (neurones[i] > maxActivation)
+            float activation = neurones[i];
+            if (activation > maxActivation)
             {
-                maxActivation = neurones[i];
+                maxActivation = activation;
                 predictedToken = i - outConnections;
-                //Debug.Log($"New best token: {predictedToken} with activation {maxActivation}");
             }
         }
         
-        // Если все активации отрицательные, используем UNK
-        if (maxActivation <= -1f)
-        {
-            predictedToken = Tokenizer.UNK_TOKEN;
-        }
+        if (maxActivation <= -0.9f || predictedToken < 0 || predictedToken >= vocabSize)
+            return Tokenizer.UNK_TOKEN;
         
-        // Проверяем, что токен в допустимом диапазоне
-        if (predictedToken < 0 || predictedToken >= vocabSize)
-        {
-            predictedToken = Tokenizer.UNK_TOKEN;
-        }
-        
-        // Сохраняем токен (кроме повторного SOS)
-        if (!(outputTokens.Count > 0 && outputTokens.Last() == Tokenizer.SOS_TOKEN && predictedToken == Tokenizer.SOS_TOKEN))
-        {
-            outputTokens.Add(predictedToken);
-            //Debug.Log($"Added token {predictedToken} to output. Total tokens: {outputTokens.Count}");
-        }
-        
-        // Детокенизируем для отображения
-        if (tokenizer != null)
-        {
-            generatedText = tokenizer.Detokenize(outputTokens);
-            //Debug.Log($"Generated text: {generatedText}");
-        }
-        
-        // Подготавливаем следующий вход (авторегрессия)
-        nextInputToken = predictedToken;
-        
-        // Проверка окончания генерации
-        bool shouldFinish = false;
-        
-        if (predictedToken == Tokenizer.EOS_TOKEN)
-        {
-            shouldFinish = true;
-        }
-        else if (outputTokens.Count >= Math.Max(targetTokens.Count + 10, 50))
-        {
-            //Debug.Log($"Max length reached ({outputTokens.Count}), finishing generation");
-            shouldFinish = true;
-        }
-        else if (iterations >= maxIterations)
-        {
-            //Debug.Log($"Max iterations reached ({iterations}), finishing generation");
-            shouldFinish = true;
-        }
-        
-        if (shouldFinish)
-        {
-            FinishGeneration();
-        }
-        
-        UpdateRNNState();
-        iterations++;
-    }
-    
-    private void FinishGeneration()
-    {
-        go = false;
-        isGenerating = false;
-        
-        CalculateTokenFitness();
-        
-        cIterator = 0;
-    }
-    
-    private void CalculateTokenFitness()
-    {
-        if (targetTokens.Count == 0 || outputTokens.Count == 0)
-        {
-            howIsGood = 0f;
-            return;
-        }
-        
-        // 1. Точное совпадение последовательностей
-        int exactMatches = 0;
-        int minLength = Mathf.Min(outputTokens.Count, targetTokens.Count);
-        
-        for (int i = 0; i < minLength; i++)
-        {
-            if (outputTokens[i] == targetTokens[i])
-                exactMatches++;
-        }
-        
-        float exactMatchScore = targetTokens.Count > 0 ? 
-            (float)exactMatches / targetTokens.Count : 0f;
-        
-        // 2. Совпадение уникальных слов (исключая служебные)
-        var outputWords = new HashSet<int>();
-        var targetWords = new HashSet<int>();
-        
-        foreach (var token in outputTokens)
-        {
-            if (token > 3) // Исключаем служебные
-                outputWords.Add(token);
-        }
-        
-        foreach (var token in targetTokens)
-        {
-            if (token > 3)
-                targetWords.Add(token);
-        }
-        
-        outputWords.IntersectWith(targetWords);
-        
-        float wordMatchScore = targetWords.Count > 0 ? 
-            (float)outputWords.Count / targetWords.Count : 0f;
-        
-        // 3. Наибольшая общая подпоследовательность
-        float lcsScore = CalculateLCS(outputTokens, targetTokens);
-        
-        // 4. Бонус за правильную структуру
-        float structureBonus = 0f;
-        
-        if (outputTokens.Count > 0 && outputTokens[0] == Tokenizer.SOS_TOKEN)
-            structureBonus += 0.03f;
-        
-        if (outputTokens.Count > 0 && outputTokens.Last() == Tokenizer.EOS_TOKEN)
-            structureBonus += 0.03f;
-        
-        // 5. Штраф за слишком длинную генерацию
-        float penaltyForLength = 0;
-        if (outputTokens.Count > targetTokens.Count * 1.5f)
-        {
-            penaltyForLength = -(outputTokens.Count / (float)targetTokens.Count) * 0.1f;
-        }
-        
-        // 6. Бонус за разнообразие (использование разных слов)
-        float diversityBonus = 0f;
-        if (outputWords.Count > 3)
-        {
-            diversityBonus = Mathf.Min(0.1f, outputWords.Count / 30f);
-        }
-        
-        // 7. Штраф за повторение одного слова много раз
-        float repetitionPenalty = 0f;
-        var tokenCounts = new Dictionary<int, int>();
-        foreach (var token in outputTokens)
-        {
-            if (token > 3)
-            {
-                if (!tokenCounts.ContainsKey(token)) tokenCounts[token] = 0;
-                tokenCounts[token]++;
-            }
-        }
-        foreach (var kvp in tokenCounts)
-        {
-            if (kvp.Value > 5)
-            {
-                repetitionPenalty -= 0.05f;
-            }
-        }
-        
-        textHowIsGood = Mathf.Min(200.0f, 
-            exactMatchScore * 0.4f + 
-            wordMatchScore * 0.3f + 
-            lcsScore * 0.2f +
-            structureBonus +
-            penaltyForLength +
-            diversityBonus +
-            repetitionPenalty);
-        
-        howIsGood = Mathf.Min(200.0f, textHowIsGood);
-        
-        accumulatedFitness += howIsGood;
-        ++processedInBatch;
-    }
-    
-    private float CalculateLCS(List<int> a, List<int> b)
-    {
-        if (a.Count == 0 || b.Count == 0) return 0f;
-        
-        int[,] dp = new int[a.Count + 1, b.Count + 1];
-        
-        for (int i = 1; i <= a.Count; i++)
-        {
-            for (int j = 1; j <= b.Count; j++)
-            {
-                if (a[i - 1] == b[j - 1])
-                {
-                    dp[i, j] = dp[i - 1, j - 1] + 1;
-                }
-                else
-                {
-                    dp[i, j] = Mathf.Max(dp[i - 1, j], dp[i, j - 1]);
-                }
-            }
-        }
-        
-        return (float)dp[a.Count, b.Count] / Mathf.Max(a.Count, b.Count, 1);
+        return predictedToken;
     }
     
     private void UpdateRNNState()
@@ -479,13 +370,14 @@ public class AI : MonoBehaviour
     {
         this.tokenizer = tokenizer;
         this.vocabSize = tokenizer.GetVocabSize();
-        outConnections = 1; // Только bias для генератора
+        // Синхронизируем outConnections с логикой Start(): выходные нейроны начинаются после входных (bias + vocabSize входов)
+        outConnections = 2 + vocabSize;
     }
     
     public void UpdateAvailableTokens(HashSet<int> tokens)
     {
         availableTokens = new HashSet<int>(tokens);
-        UpdateAvailableNeurons();
+        UpdateAvailableNeurons(availableTokens);
     }
     
     public void AddNode()
@@ -592,7 +484,7 @@ public class AI : MonoBehaviour
         }
         else
         {
-            if (UnityEngine.Random.Range(0, 6) >= 2)
+            if (UnityEngine.Random.Range(0, 6) >= 3)
             {
                 if (RNNs.Count > 0)
                 {
@@ -610,84 +502,105 @@ public class AI : MonoBehaviour
     
     public List<int> GenToPh()
     {
+        // Копируем данные
         List<float> _weights = new List<float>(weights);
         List<int> _inpInnov = new List<int>(inpInnov);
         List<int> _outInnov = new List<int>(outInnov);
         List<bool> _actConnect = new List<bool>(actConnect);
         List<bool> _RNNs = new List<bool>(RNNs);
-        List<int> nullConn = new List<int>();
-        List<int> inDegree = new List<int>();
-        List<int> order1 = new List<int>();
-        int neuronesCount = neurones.Count;
+
+        // --- 1. Множество всех нейронов, реально используемых в любой enabled связи ---
+        HashSet<int> usedNeurons = new HashSet<int>();
+        usedNeurons.Add(0); // bias
+
         for (int i = 0; i < _actConnect.Count; i++)
         {
-            if (_actConnect[i] == false || _RNNs[i] == true)
+            if (_actConnect[i]) // связь активна
             {
-                _actConnect.RemoveAt(i);
-                _weights.RemoveAt(i);
-                _inpInnov.RemoveAt(i);
-                _outInnov.RemoveAt(i);
-                _RNNs.RemoveAt(i);
-                --i;
+                usedNeurons.Add(_inpInnov[i]);
+                usedNeurons.Add(_outInnov[i]);
             }
         }
+
+        // --- 2. Построение adjList ТОЛЬКО для feed-forward активных связей ---
         adjList.Clear();
         for (int i = 0; i < neurones.Count; i++)
-        {
             adjList.Add(new Dictionary<int, float>());
-        }
-        for (int i = 0; i < _inpInnov.Count; i++)
+
+        for (int i = 0; i < _actConnect.Count; i++)
         {
-            adjList[_inpInnov[i]].Add(_outInnov[i], _weights[i]);
+            if (_actConnect[i] && !_RNNs[i]) // feed-forward, enabled
+            {
+                adjList[_inpInnov[i]][_outInnov[i]] = _weights[i];
+            }
         }
-        for (int i = 0; i < adjList.Count; i++)
-        {
-            inDegree.Add(0);
-        }
+
+        // --- 3. Степени входа (in-degree) только для feed-forward связей и только usedNeurons ---
+        Dictionary<int, int> inDegree = new Dictionary<int, int>();
+        foreach (int n in usedNeurons)
+            inDegree[n] = 0;
+
         for (int i = 0; i < neurones.Count; i++)
         {
-            foreach (var b in adjList[i])
+            if (!usedNeurons.Contains(i)) continue;
+            foreach (var kv in adjList[i]) // kv = KeyValuePair<int, float>
             {
-                ++inDegree[b.Key];
+                int to = kv.Key;
+                if (usedNeurons.Contains(to))
+                    inDegree[to]++;
             }
         }
-        for (int i = 0; i < inDegree.Count; i++)
+
+        // --- 4. Топологическая сортировка ---
+        List<int> nullConn = new List<int>();
+        foreach (int n in usedNeurons)
+            if (inDegree[n] == 0)
+                nullConn.Add(n);
+
+        List<int> order1 = new List<int>();
+        for (int i = 0; i < nullConn.Count; i++)
         {
-            if (inDegree[i] == 0)
+            int u = nullConn[i];
+            order1.Add(u);
+            foreach (var kv in adjList[u])
             {
-                nullConn.Add(i);
-            }
-        }
-        for (int i = 0; i != nullConn.Count; ++i)
-        {
-            int ie = nullConn[i];
-            order1.Add(ie);
-            foreach (var b in adjList[ie])
-            {
-                int a = b.Key;
-                --inDegree[b.Key];
-                if (inDegree[a] == 0)
+                int v = kv.Key;
+                if (usedNeurons.Contains(v))
                 {
-                    nullConn.Add(b.Key);
+                    inDegree[v]--;
+                    if (inDegree[v] == 0)
+                        nullConn.Add(v);
                 }
             }
         }
-        if (order1.Count != neuronesCount)
+
+        // Проверка на циклы
+        if (order1.Count != usedNeurons.Count)
         {
-            return new List<int> { 1, outConnections, 0 };
+            return new List<int> { 1, outConnections, 0 }; // сигнал ошибки
         }
-        if (!order1.Any())
-        {
-            Debug.Log("Empty");
-            return new List<int> { 1, outConnections, 0 };
-        }
+
         return order1;
     }
     
     public void makeOrder()
     {
-        List<int> a = GenToPh();
-        order = a;
+        order = GenToPh();
+        // Сохраняем информацию о наличии feed-forward входов
+        neuronHasFFIncoming.Clear();
+        // Сначала у всех false
+        foreach (int n in order)
+            neuronHasFFIncoming[n] = false;
+        // Проходим по feed-forward связям и отмечаем цели
+        for (int i = 0; i < inpInnov.Count; i++)
+        {
+            if (actConnect[i] && !RNNs[i]) // enabled и не рекуррентная
+            {
+                int to = outInnov[i];
+                if (neuronHasFFIncoming.ContainsKey(to))
+                    neuronHasFFIncoming[to] = true;
+            }
+        }
     }
     
     public void Adder()
@@ -711,38 +624,20 @@ public class AI : MonoBehaviour
 
     public bool correctGen(List<int> a)
     {
-        List<int> genes = new List<int>(a);
-        bool yes = true;
-        if(a.SequenceEqual(new List<int> {1, outConnections, 0})){
-            return false;
-        }
-        if (genes[0] == 0 || genes[0] > outConnections)
-        {
-            genes.RemoveRange(0, genes.Count - 3);
-            for (int i = 1; i != outConnections + 1; ++i)
-            {
-                if (genes.Contains(i))
-                {
-                    yes = false;
-                    break;
-                }
-            }
-        }
-        return yes;
+        if (a == null || a.Count == 0) return false;
+        if (a.SequenceEqual(new List<int> { 1, outConnections, 0 })) return false;
+        return true;
     }
 
     public void ResetForNewPhase()
     {
         go = true;
-        isGenerating = false;
+        generationComplete = false;
         howIsGood = 0;
         textHowIsGood = 0;
         cIterator = 0;
-        currentTokenIndex = 0;
-        nextInputToken = 1;
         generatedText = "";
         outputTokens.Clear();
-        iterations = 0;
         
         for (int i = 0; i < neurones.Count; i++)
         {
@@ -752,59 +647,147 @@ public class AI : MonoBehaviour
         neurones[0] = 1f;
         RNNneurones[0] = 1f;
         
-        UpdateAvailableNeurons();
-    }
+        UpdateAvailableNeurons(availableTokens);
 
-    private void UpdateAvailableNeurons()
+        // Пересоздаём seedTokens на основе текущего inputPhrase
+        if (tokenizer != null && targetTokens != null && targetTokens.Count > 2)
+        {
+            int maxSeed = Mathf.Min(seedLength, targetTokens.Count - 2);
+            seedTokens = targetTokens.Skip(1).Take(maxSeed).ToList();
+            if (seedTokens.Count == 0)
+                seedTokens.Add(Tokenizer.SOS_TOKEN);
+        }
+        else
+        {
+            seedTokens = new List<int>() { Tokenizer.SOS_TOKEN };
+        }
+
+        // NEW: пересчитываем ожидаемый токен
+        ComputeExpectedToken();
+        
+        seedProcessed = false;
+        generationComplete = false;
+        seedIndex = 0;
+        currentContext.Clear();
+        outputTokens.Clear();
+    }
+    public void UpdateAvailableNeurons(HashSet<int> activeTokens)
     {
         availableInputNeurons.Clear();
         availableOutputNeurons.Clear();
-        
-        // Входные нейроны:
-        // 1. bias (0)
+
+        // Bias всегда доступен
         availableInputNeurons.Add(0);
-        
-        // 2. Все входные нейроны для токенов (1..vocabSize)
-        for (int i = 1; i <= vocabSize; i++)
+        // Phase всегда доступен
+        availableInputNeurons.Add(1);
+
+        // Входные токены (индексы 2..1+vocabSize)
+        foreach (int token in activeTokens)
         {
-            if (i < neurones.Count)
-            {
-                availableInputNeurons.Add(i);
-            }
+            int inputIdx = token + 2;
+            if (inputIdx < neurones.Count)
+                availableInputNeurons.Add(inputIdx);
         }
-        
-        // Выходные нейроны:
-        // Начинаются с outConnections (1 + vocabSize)
-        for (int i = outConnections; i < outConnections + vocabSize; i++)
+
+        // Выходные токены (начинаются с outConnections)
+        foreach (int token in activeTokens)
         {
-            if (i < neurones.Count)
-            {
-                availableOutputNeurons.Add(i);
-            }
+            int outputIdx = outConnections + token;
+            if (outputIdx < neurones.Count)
+                availableOutputNeurons.Add(outputIdx);
         }
-        
-        // Скрытые нейроны (если есть)
+
+        // Скрытые нейроны (после выходных)
         int hiddenStart = outConnections + vocabSize;
         for (int i = hiddenStart; i < neurones.Count; i++)
         {
-            // Скрытые нейроны могут быть и входами и выходами
-            if (!availableInputNeurons.Contains(i))
-                availableInputNeurons.Add(i);
-            if (!availableOutputNeurons.Contains(i))
-                availableOutputNeurons.Add(i);
+            availableInputNeurons.Add(i);
+            availableOutputNeurons.Add(i);
         }
     }
 
+    public NeatModelData ToModelData()
+    {
+        var data = new NeatModelData();
+        data.vocabulary = tokenizer.ExportVocabulary();
+        data.vocabSize = vocabSize;
+        data.outputStart = outConnections;
+
+        // Размер сети
+        data.neuronCount = neurones.Count;
+
+        // Топологический порядок и флаги activationFunction
+        data.order = order.ToArray();
+        data.neuronHasFFIncoming = new bool[neurones.Count];
+        foreach (var kv in neuronHasFFIncoming)
+            data.neuronHasFFIncoming[kv.Key] = kv.Value;
+
+        // RNN decay
+        data.rnnDecay = 0.95f;
+
+        // Связи
+        data.connections = new ConnectionGene[inpInnov.Count];
+        for (int i = 0; i < inpInnov.Count; i++)
+        {
+            data.connections[i] = new ConnectionGene
+            {
+                from = inpInnov[i],
+                to = outInnov[i],
+                weight = weights[i],
+                enabled = actConnect[i],
+                recurrent = RNNs[i]
+            };
+        }
+
+        return data;
+    }
     public float GetBatchAverageFitness()
     {
-        if (processedInBatch == 0) return 0f;
-        return accumulatedFitness / processedInBatch;
+        if (processedInBatch == 0)
+        {
+            textHowIsGood = 0f;
+            return 0f;
+        }
+        textHowIsGood = accumulatedFitness / processedInBatch;
+        return textHowIsGood;
+    }
+
+    public float GetNewPhraseAverageFitness()
+    {
+        if (processedNewInBatch == 0)
+        {
+            newPhraseFitness = 0f;
+            return 0f;
+        }
+        newPhraseFitness = accumulatedNewFitness / processedNewInBatch;
+        return newPhraseFitness;
+    }
+    private float[] Softmax(float[] activations, float temperature = 1.0f)
+    {
+        float[] exp = new float[activations.Length];
+        float sum = 0f;
+        for (int i = 0; i < activations.Length; i++)
+        {
+            exp[i] = Mathf.Exp(activations[i] / temperature);
+            sum += exp[i];
+        }
+        for (int i = 0; i < activations.Length; i++)
+            exp[i] /= sum;
+        return exp;
+    }
+
+    public double activationFunction(double x)
+    {
+        //ReLU or Tanh or GelU or something else?
+        return Math.Tanh(x);
     }
     
     public void ResetBatchStats()
     {
         accumulatedFitness = 0f;
         processedInBatch = 0;
+        accumulatedNewFitness = 0f;
+        processedNewInBatch = 0;
     }
 
     public int getInitalNeurones()
