@@ -8,6 +8,7 @@ using System.Data;
 using UnityEditor;
 using Random = UnityEngine.Random;
 using Unity.VisualScripting;
+using System.IO; 
 
 public class GameManager : MonoBehaviour
 {
@@ -31,7 +32,7 @@ public class GameManager : MonoBehaviour
     public float rotationY = 0f;
     public int countBatch = 0;
 
-    public int batchSize = 0;
+    public int batchSize = 1;
     public Vector3 VectorDistance;
 
     public List<string> wordTranslate;
@@ -47,9 +48,12 @@ public class GameManager : MonoBehaviour
     private HashSet<int> availableTokens = new HashSet<int>();
     private int currentPhase = 1;
     private int phrasesPerPhase = 1;
-    private int initialPhrases = 5;
+    public int initialPhrases = 1;//Проверяю между 1 и 5
+    public int currentSeedLength = 4;
     public int phrasesIncrement = 1;
     public float phaseThreshold = 0.7f;
+
+    public bool saveModel = false;
 
     void Start()
     {
@@ -84,7 +88,7 @@ public class GameManager : MonoBehaviour
         
         Debug.Log($"Tokenizer created: {vocabSize} English tokens");
 
-        wordTranslate = phrasesComponent.GetPhrase();
+        wordTranslate = phrasesComponent.GetPhrase(true);
         if (wordTranslate.Count >= 2)
         {
             englishPhrase = wordTranslate[1];
@@ -158,8 +162,13 @@ public class GameManager : MonoBehaviour
         
         if (startNewEpoch)
         {
+            if (saveModel)
+            {
+                ExportBestModel(Application.dataPath + "/best_model.json");
+                saveModel = false;
+            }
             Phrases phrasesComponent = GetComponent<Phrases>();
-            wordTranslate = phrasesComponent.GetPhrase();
+            wordTranslate = phrasesComponent.GetPhrase(countBatch == 0);
             
             if (wordTranslate.Count >= 2)
             {
@@ -167,7 +176,23 @@ public class GameManager : MonoBehaviour
                 targetPhrase = wordTranslate[1];
             }
             bool ifNew = wordTranslate.Count >= 3 && wordTranslate[2] == "Yes";
-            
+
+            int targetLen = tokenizer.Tokenize(targetPhrase).Count;
+            // Рассчитываем максимальную длину seed, чтобы после неё остался хотя бы один токен(не включая EOS - модель зацикливается на нем)
+            //int maxSeed = Mathf.Max(0, targetLen - 3);
+            //Выбираем так, чтобы было несколько первых токенов для контекста, либо хотя бы два токена, без учета EOS.
+            int maxSeed = Mathf.Max(2, targetLen - 4);
+            if (maxSeed > 0)
+            {
+                // Выбираем случайную длину seed от 0 до maxSeed включительно
+                //currentSeedLength = Random.Range(2, maxSeed + 1);\
+                currentSeedLength = Random.Range(2, 4);
+            }
+            else
+            {
+                currentSeedLength = 0;
+            }
+
             AIs.Clear();
             
             if (countBatch < batchSize)
@@ -176,7 +201,9 @@ public class GameManager : MonoBehaviour
                 .Where(o => o.GetComponent<AI>().spawnerOfNN.name == gameObject.name)
                 .OrderByDescending(o => o.GetComponent<AI>().howIsGood).ToList();
                 AI _bestAI = listOfAIs[0].GetComponent<AI>();
-                if (_bestAI.ifNew == true && _bestAI.textHowIsGood > phaseThreshold)
+                float newFitness = _bestAI.GetNewPhraseAverageFitness(); // получаем среднее только по новым фразам
+
+                if (_bestAI.ifNew && newFitness >= phaseThreshold)
                 {
                     ++amountOfRightAnswers;
                 }
@@ -193,7 +220,8 @@ public class GameManager : MonoBehaviour
                         ai.inputTokens = tokenizer.Tokenize(englishPhrase);
                         ai.targetTokens = tokenizer.Tokenize(targetPhrase);
                         
-                        ai.Start();
+                        //ai.Start(); Возможно, здесь это неправильно
+                        ai.ResetForNewPhase();
                 }
                 
                 ++countBatch;
@@ -263,6 +291,7 @@ public class GameManager : MonoBehaviour
                 }
             }
             AI bestAI = SortedList[0].GetComponent<AI>();
+            diagram.GetComponent<Diagram>().SetBestAI(bestAI);
             string generatedText = bestAI.generatedText;
             if (string.IsNullOrEmpty(generatedText) && tokenizer != null && bestAI.outputTokens.Count > 0)
             {
@@ -274,12 +303,12 @@ public class GameManager : MonoBehaviour
                             $"Generated: {generatedText}";
             theBest.Add(logEntry);
             
-            if(bestAI.ifNew == true && bestAI.textHowIsGood >= phaseThreshold)
+            if(bestAI.ifNew == true && bestAI.textHowIsGood >= phaseThreshold) //Нужно будет считать не весь фитнесс, а только за саму новую фразу, однако пока это не реализовано
             {
                 ++amountOfRightAnswers;
             }
 
-            if (amountOfRightAnswers >= 3)
+            if (amountOfRightAnswers >= 2)// || epoch % 500 == 0)
             {
                 var allPhrases = GetComponent<Phrases>().GetAllPhrases();
 
@@ -290,7 +319,8 @@ public class GameManager : MonoBehaviour
                 {
                     var enTokens = tokenizer.Tokenize(allPhrases[i][1]);
 
-                    foreach (var token in enTokens){
+                    foreach (var token in enTokens)
+                    {
                         if (token >= 4) availableTokens.Add(token);
                     }
                 }
@@ -299,16 +329,29 @@ public class GameManager : MonoBehaviour
 
                 Debug.Log($"Advanced to Phase {currentPhase}: {availableTokens.Count} tokens available");
 
+                // Получаем новую фразу для следующего этапа
+                wordTranslate = phrasesComponent.GetPhrase(countBatch == 0);
+                englishPhrase = wordTranslate[1];
+                targetPhrase = wordTranslate[1];
+                ifNew = wordTranslate.Count >= 3 && wordTranslate[2] == "Yes";
+
+                // Обновляем все существующие AI
                 foreach (var aiObj in GameObject.FindGameObjectsWithTag("Player"))
                 {
                     AI ai = aiObj.GetComponent<AI>();
-                    ai.UpdateAvailableTokens(availableTokens);
+                    ai.inputPhrase = englishPhrase;
+                    ai.targetPhrase = targetPhrase;
+                    ai.ifNew = ifNew;
+                    ai.inputTokens = tokenizer.Tokenize(englishPhrase);
+                    ai.targetTokens = tokenizer.Tokenize(targetPhrase);
                     ai.ResetForNewPhase();
+                    ai.UpdateAvailableTokens(availableTokens);
                 }
 
                 phrasesComponent.changeWord = true;
                 amountOfRightAnswers = 0;
                 ifNew = false;
+                batchSize = Math.Min(phrasesComponent.lengthOfknown, 10);
             }
 
 
@@ -391,6 +434,7 @@ public class GameManager : MonoBehaviour
                     Quaternion.identity);
                 
                 AI offspringAI = offspring.GetComponent<AI>();
+                offspringAI.seedLength = currentSeedLength; 
                 offspringAI.SetTokenizer(tokenizer);
                 offspringAI.UpdateAvailableTokens(availableTokens);
 
@@ -489,7 +533,7 @@ public class GameManager : MonoBehaviour
                 {
                     offspringAI.addition = 1;
                 }
-                else if (chooseAddition < 6)
+                else if (chooseAddition < 8)
                 {
                     offspringAI.addition = 2;
                 }
@@ -504,7 +548,7 @@ public class GameManager : MonoBehaviour
                     {
                         offspringAI.actConnect[Random.Range(0, offspringAI.actConnect.Count)] = false;
                     }
-                    else if (Random.Range(0, 5) < 1)
+                    else if (Random.Range(0, 5) <= 1)
                     {
                         List<int> check = new List<int>();
                         for (int j = 0; j < offspringAI.actConnect.Count; j++)
@@ -573,7 +617,7 @@ public class GameManager : MonoBehaviour
                 offspringAI.Start();
             }
             
-            wordTranslate = phrasesComponent.GetPhrase();
+            wordTranslate = phrasesComponent.GetPhrase(countBatch == 0);
 
             AIs = AIs.OrderByDescending(o => o.GetComponent<AI>().howIsGood).ToList();
             for (int i = 0; i != population; ++i)
@@ -582,8 +626,9 @@ public class GameManager : MonoBehaviour
                 {
                     Debug.Log("Not equal amount!");
                 }
-                if (i < 50)
+                if (i < selection)
                 {
+                    SortedList[i].GetComponent<AI>().seedLength = currentSeedLength;
                     SortedList[i].GetComponent<AI>().inputPhrase = englishPhrase;
                     SortedList[i].GetComponent<AI>().targetPhrase = targetPhrase;
                     SortedList[i].GetComponent<AI>().ifNew = ifNew;
@@ -614,7 +659,7 @@ public class GameManager : MonoBehaviour
         
         var allPhrases = GetComponent<Phrases>().GetAllPhrases();
         int phrasesToUse = Mathf.Min(initialPhrases, allPhrases.Count);
-        
+
         Debug.Log($"Initializing tokens: {phrasesToUse} phrases to use from {allPhrases.Count} total");
         
         for (int i = 0; i < phrasesToUse; i++)
@@ -629,7 +674,6 @@ public class GameManager : MonoBehaviour
                 }
             }
         }
-        
         GetComponent<Phrases>().lengthOfknown = phrasesToUse;
         currentPhase = phrasesToUse;
         Debug.Log($"Phase {currentPhase}: {availableTokens.Count} tokens available");
@@ -653,5 +697,30 @@ public class GameManager : MonoBehaviour
         oInn.Add(outV);
         RNN.Add(rnnV);
         return iInn.Count - 1;
+    }
+
+    public void ExportBestModel(string filePath)
+    {
+        // Найти лучшую особь (сортировка по howIsGood)
+        var ais = GameObject.FindGameObjectsWithTag("Player")
+            .Where(o => o.GetComponent<AI>().spawnerOfNN.name == gameObject.name)
+            .OrderByDescending(o => o.GetComponent<AI>().howIsGood)
+            .ToList();
+
+        if (ais.Count == 0)
+        {
+            Debug.LogError("No AI found to export.");
+            return;
+        }
+
+        AI best = ais[0].GetComponent<AI>();
+        best.makeOrder(); // обновить топологию и флаги
+        NeatModelData modelData = best.ToModelData();
+
+        // Сериализация в JSON через JsonUtility
+        string json = JsonUtility.ToJson(modelData, prettyPrint: true);
+        File.WriteAllText(filePath, json);
+
+        Debug.Log($"Model exported to {filePath}");
     }
 }
